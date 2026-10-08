@@ -10,7 +10,7 @@
 在干净的 Debian 12/13 或 Ubuntu 22.04+ VPS 上：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kuisa/dsfree2api-mod/main/deploy.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/YOURNAME/turnstile-solver/main/deploy.sh -o deploy.sh
 bash deploy.sh
 ```
 
@@ -102,7 +102,7 @@ Authorization: Bearer {api_key}
 
 | 场景 | 基线 | 行为 |
 |---|---|---|
-| 工作时 | 额度 `PREWARM_MIN_REMAINING`（默认 10000，即用满 20000） | 请求时用**缓存**额度判断（零延迟），低额站点排最后；同时唤醒后台立刻换访客身份重置额度 |
+| 工作时 | 额度 `PREWARM_MIN_REMAINING`（默认 10000）**或**剩余比例 `PREWARM_THRESHOLD`（默认 0.20，即用满 80%）—— 谁先到算谁 | 请求时用**缓存**额度判断（零延迟），低额站点排最后；同时唤醒后台立刻换访客身份重置额度 |
 | 闲置时 | 时效 `PREWARM_REFRESH_BEFORE_MINUTES`（默认 30） | 会话存活满 `cookie_ttl - 30min`（默认 150 分钟）主动刷新，不等过期 |
 
 实测效果：三站从 `0/0/29925` 后台预热成 `30000/30000/30000`；请求从 25 秒降到 **1 秒**。
@@ -214,7 +214,8 @@ curl -s http://127.0.0.1:8002/health
 | `SITEKEY` / `ACTION` | 见脚本 | 目标站点的 Turnstile 参数 |
 | `BASE_DIR` | `/opt/turnstile-stack` | 安装目录 |
 | `DSFREE_COMMIT` | `4cc4504` | 补丁对应的版本（别乱改） |
-| `PREWARM_MIN_REMAINING` | `10000` | 额度基线 |
+| `PREWARM_MIN_REMAINING` | `10000` | 额度绝对值基线（设 0 = 关闭这条，只用比例） |
+| `PREWARM_THRESHOLD` | `0.20` | 剩余比例基线：剩余降到 limit 的 20%（= 用满 80%）就刷新。**站点额度是 10000 还是 30000 都适用** |
 | `PREWARM_REFRESH_BEFORE_MINUTES` | `30` | 时效提前量 |
 | `RAW_BASE` | 见脚本 | 脚本不在仓库里时的下载地址 |
 

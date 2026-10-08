@@ -1,21 +1,20 @@
 diff --git a/cmd/dsfree2api/main.go b/cmd/dsfree2api/main.go
-index 127a38e..ee18db1 100644
+index 5ad84b8..056fdc8 100644
 --- a/cmd/dsfree2api/main.go
 +++ b/cmd/dsfree2api/main.go
-@@ -76,6 +76,12 @@ func main() {
+@@ -126,6 +126,11 @@ func run() int {
+ 	quotaWatch := quota.New(cfg, logger, ts, pool)
+ 	quotaWatch.Start(quotaCtx)
  
- 	ts := turnstile.New(cfg.Turnstile, cfg.Upstream.UserAgent)
- 	up := upstream.New(cfg, ts, logger)
-+
 +	// 后台预热：定期查余额、快用尽时提前换访客身份、并保持会话温热，
 +	// 这样请求到来时不必现付一次求解/握手成本。
 +	prewarmCtx, prewarmCancel := context.WithCancel(context.Background())
 +	prewarm := up.StartPrewarm(prewarmCtx)
 +
  	apiSrv := api.New(cfg, up, met, logs, ts, logger)
- 	adminSrv := admin.New(cfg, up, met, logs, ts, logger)
+ 	adminSrv := admin.New(cfg, up, met, logs, ts, logger, pool, quotaWatch)
  
-@@ -129,6 +135,8 @@ func main() {
+@@ -179,6 +184,8 @@ func run() int {
  	if adminHTTP != nil {
  		_ = adminHTTP.Shutdown(ctx)
  	}
@@ -23,20 +22,23 @@ index 127a38e..ee18db1 100644
 +	prewarm.Stop()
  	met.Close()
  	logger.Info("bye")
- }
+ 	return 0
 diff --git a/docker-compose.yml b/docker-compose.yml
-index 65d4bc6..6f7181d 100644
+index 65d4bc6..657963e 100644
 --- a/docker-compose.yml
 +++ b/docker-compose.yml
-@@ -10,12 +10,19 @@ services:
+@@ -10,12 +10,22 @@ services:
        # Web console listens on 127.0.0.1 by default; expose it to reach it
        # from outside the container (put a reverse proxy in front of it).
        ADMIN_HOST: 0.0.0.0
 -      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-test}
++      # 必须显式设置：留空会被 applyEnv 当成有效值覆盖 config.toml，
++      # 导致管理台密码变空。deploy.sh 会自动生成并写入 .env。
++      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?未设置 ADMIN_PASSWORD：请用 deploy.sh，或在 .env 里填一个强密码}
        TURNSTILE_API_KEY: ${TURNSTILE_API_KEY:-}
 -      API_KEYS: ${API_KEYS:-}
-+      API_KEYS: ${API_KEYS:-test}
++      # 同上：不要留空，否则下游 API Key 变空字符串。
++      API_KEYS: ${API_KEYS:?未设置 API_KEYS：请用 deploy.sh，或在 .env 里填一个强 key}
        PROXY_URL: ${PROXY_URL:-}
        PROXY_FALLBACK_URLS: ${PROXY_FALLBACK_URLS:-}
        PROXY_SLOW_START_SECONDS: ${PROXY_SLOW_START_SECONDS:-8}
@@ -50,39 +52,11 @@ index 65d4bc6..6f7181d 100644
      volumes:
        - ./data:/app/data
        # 先执行: cp config.example.toml config.toml
-diff --git a/internal/api/chat.go b/internal/api/chat.go
-index 0d2c038..50caee9 100644
---- a/internal/api/chat.go
-+++ b/internal/api/chat.go
-@@ -148,7 +148,10 @@ func (s *Server) completeChat(ctx context.Context, w http.ResponseWriter, req op
- }
- 
- func buildCompletion(req openai.ChatCompletionRequest, prompt, body string) *openai.ChatCompletionResponse {
--	message := openai.ChoiceMessage{Content: body}
-+	// Role 必须显式设为 "assistant"：ChoiceMessage.Role 没有 omitempty，
-+	// 不赋值就会序列化成 "role": ""，严格的 OpenAI 客户端（Cline/Cursor/
-+	// Continue 等）会因为 role 非法直接报错。
-+	message := openai.ChoiceMessage{Role: "assistant", Content: body}
- 	if len(req.Tools) > 0 {
- 		remaining, calls, ok := openai.TryParseToolCalls(body)
- 		if ok {
-@@ -301,7 +304,10 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
- 		}},
- 	}
- 	deltaPayload := map[string]any{}
--	if content != "" {
-+	// 只有缓冲模式（带工具）才需要在这里补发正文 —— 那种模式下正文没有
-+	// 增量发送过。非缓冲模式下正文已经逐块发过了，末帧再发一遍会让客户端
-+	// 重复显示整段内容。
-+	if content != "" && buffered {
- 		deltaPayload["content"] = content
- 	}
- 	if len(toolCalls) > 0 {
 diff --git a/internal/turnstile/solver.go b/internal/turnstile/solver.go
-index a5982f1..4cab63d 100644
+index 4ff37c2..6f717cb 100644
 --- a/internal/turnstile/solver.go
 +++ b/internal/turnstile/solver.go
-@@ -217,6 +217,20 @@ func (s *Solver) GuestID(siteCode, proxy string) (string, bool) {
+@@ -238,6 +238,20 @@ func (s *Solver) GuestID(siteCode, proxy string) (string, bool) {
  	return gid, gid != ""
  }
  
@@ -104,18 +78,18 @@ index a5982f1..4cab63d 100644
  // passed the Turnstile check, so chat works while [turnstile] is off or the
  // solver service is down. Cookies are bound to the IP/UA that obtained them,
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index d068935..a18f5c7 100644
+index c10861b..756f2c6 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
-@@ -14,6 +14,7 @@ import (
+@@ -17,6 +17,7 @@ import (
  	"strconv"
  	"strings"
  	"sync"
 +	"sync/atomic"
  	"time"
+ 	"unicode/utf8"
  
- 	"github.com/nyoungo/dsfree2api/internal/config"
-@@ -54,11 +55,27 @@ type Client struct {
+@@ -72,6 +73,26 @@ type Client struct {
  	// quotaCool marks sites that recently answered with quota errors; they
  	// are tried after the healthy mirrors until the cooldown expires.
  	quotaCool map[string]time.Time
@@ -127,6 +101,14 @@ index d068935..a18f5c7 100644
 +	// whose cached free tier falls to or below it is routed around until the
 +	// background refresher restores it.
 +	minRemaining int
++	// quotaLimit caches each site's daily free-tier limit alongside the
++	// remaining balance, so the request path can apply the same ratio rule
++	// the background refresher uses (the limit varies per site / per tier).
++	quotaLimit map[string]int
++	// minRemainingRatio is the PREWARM_THRESHOLD ratio. A site whose cached
++	// balance has fallen to this fraction of its own limit is routed around
++	// — "refresh once 80% is used" then holds whether the limit is 10k or 30k.
++	minRemainingRatio float64
 +	// prewarmTrigger lets request-time routing wake the background refresher
 +	// for a specific site immediately, instead of waiting for the next tick.
 +	prewarmMu      sync.Mutex
@@ -134,33 +116,39 @@ index d068935..a18f5c7 100644
  	// lastWarn* dedupes repeated identical upstream errors so a quota
  	// storm cannot drown the log.
  	lastWarnMsg string
- 	lastWarnAt  time.Time
- 
+@@ -81,6 +102,9 @@ type Client struct {
+ 	// exhaustion of each request — including ones hidden by cross-site
+ 	// failover.
+ 	quotaObserver func(site, model, route string, err error)
 +	// rr drives round-robin site selection so consecutive requests do not
 +	// all start on the same endpoint.
 +	rr uint64
-+
+ 
  	// chatOnceOverride is a test seam; nil in production.
  	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
- 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
-@@ -72,10 +89,12 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
+@@ -95,11 +119,16 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
  		cfg:       cfg,
  		ts:        ts,
  		log:       log,
+-		pool:      pool,
 -		chatCfg:   map[string]chatConfig{},
 -		cfgLocks:  map[string]*sync.Mutex{},
--		gates:     map[string]chan struct{}{},
+-		gates:     map[string]*siteGate{},
 -		quotaCool: map[string]time.Time{},
++		pool:           pool,
 +		chatCfg:        map[string]chatConfig{},
 +		cfgLocks:       map[string]*sync.Mutex{},
-+		gates:          map[string]chan struct{}{},
++		gates:          map[string]*siteGate{},
 +		quotaCool:      map[string]time.Time{},
 +		quotaRemaining: map[string]int{},
++		quotaLimit:     map[string]int{},
 +		minRemaining:   envInt(envPrewarmMinRemaining, 10000),
++		// 与后台预热共用同一阈值，保证「请求时绕开」和「后台刷新」同进同退
++		minRemainingRatio: envFloat(envPrewarmThreshold, 0.20),
  	}
  }
  
-@@ -156,6 +175,21 @@ func (c *Client) sortQuotaCoolLast(ids []string) []string {
+@@ -186,6 +215,21 @@ func (c *Client) sortQuotaCoolLast(ids []string) []string {
  	return append(rest, cooled...)
  }
  
@@ -182,16 +170,39 @@ index d068935..a18f5c7 100644
  // clearQuotaCool lifts a site's cooldown once it serves again after a quota
  // error — the fresh visitor identity restored its daily tier.
  func (c *Client) clearQuotaCool(code string) {
-@@ -170,6 +204,75 @@ func (c *Client) clearQuotaCool(code string) {
+@@ -200,6 +244,96 @@ func (c *Client) clearQuotaCool(code string) {
  	}
  }
  
 +// setQuotaRemaining records the last observed free-tier remaining for a site.
 +// Called by the balance probe and by the background refresher.
-+func (c *Client) setQuotaRemaining(code string, remaining int) {
++func (c *Client) setQuotaBalance(code string, remaining, limit int) {
 +	c.stateMu.Lock()
 +	c.quotaRemaining[code] = remaining
++	c.quotaLimit[code] = limit
 +	c.stateMu.Unlock()
++}
++
++// quotaIsLow reports whether a site has dropped to either baseline: the
++// absolute PREWARM_MIN_REMAINING, or PREWARM_THRESHOLD of its own limit —
++// whichever fires first. The ratio arm makes "refresh once 80% is used" hold
++// whether the site's daily limit is 10k or 30k.
++func (c *Client) quotaIsLow(code string) bool {
++	c.stateMu.Lock()
++	remaining, seen := c.quotaRemaining[code]
++	limit := c.quotaLimit[code]
++	c.stateMu.Unlock()
++	if !seen {
++		return false
++	}
++	if c.minRemaining > 0 && remaining <= c.minRemaining {
++		return true
++	}
++	if c.minRemainingRatio > 0 && limit > 0 &&
++		float64(remaining)/float64(limit) <= c.minRemainingRatio {
++		return true
++	}
++	return false
 +}
 +
 +// quotaRemainingFor returns the cached free tier for a site. The second value
@@ -233,19 +244,17 @@ index d068935..a18f5c7 100644
 +// switch seamless: a request arriving while a site is being refreshed in the
 +// background simply lands on a full one instead of waiting or failing.
 +func (c *Client) sortLowQuotaLast(ids []string) []string {
-+	if c.minRemaining <= 0 || len(ids) < 2 {
++	if len(ids) < 2 || (c.minRemaining <= 0 && c.minRemainingRatio <= 0) {
 +		return ids
 +	}
 +	var low, rest []string
 +	for _, id := range ids {
 +		m, ok := c.modelCopy(id)
-+		if ok {
-+			if n, seen := c.quotaRemainingFor(m.Site); seen && n <= c.minRemaining {
-+				low = append(low, id)
-+				// 被换下的站点立刻推给后台刷新，不等下一轮巡检
-+				c.notifyLowQuota(m.Site)
-+				continue
-+			}
++		if ok && c.quotaIsLow(m.Site) {
++			low = append(low, id)
++			// 被换下的站点立刻推给后台刷新，不等下一轮巡检
++			c.notifyLowQuota(m.Site)
++			continue
 +		}
 +		rest = append(rest, id)
 +	}
@@ -258,16 +267,16 @@ index d068935..a18f5c7 100644
  // probeBalanceAsync logs the site's current free tier after a quota
  // recovery. Best effort — failures only show up at DEBUG.
  func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route Route) {
-@@ -190,6 +293,8 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
+@@ -220,6 +354,8 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
  		}
  		c.log.Info("site balance", "site", site.Code,
  			"remaining", bal.Free.Remaining, "limit", bal.Free.Limit)
 +		// 回填缓存，供后续请求做零延迟路由判断
-+		c.setQuotaRemaining(site.Code, bal.Free.Remaining)
++		c.setQuotaBalance(site.Code, bal.Free.Remaining, bal.Free.Limit)
  	}()
  }
  
-@@ -256,10 +361,18 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
+@@ -320,10 +456,18 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
  			candidates = append(candidates, alt)
  		}
  	}
@@ -288,7 +297,7 @@ index d068935..a18f5c7 100644
  	triedPrimary := false
 diff --git a/internal/upstream/prewarm.go b/internal/upstream/prewarm.go
 new file mode 100644
-index 0000000..5cc2b53
+index 0000000..9c96079
 --- /dev/null
 +++ b/internal/upstream/prewarm.go
 @@ -0,0 +1,370 @@
@@ -572,15 +581,15 @@ index 0000000..5cc2b53
 +		return
 +	}
 +	// 刷新缓存，供请求路径做零延迟路由判断
-+	p.c.setQuotaRemaining(site.Code, remaining)
++	p.c.setQuotaBalance(site.Code, remaining, limit)
 +
 +	ratio := float64(remaining) / float64(limit)
 +	lowByAbsolute := p.minRemaining > 0 && remaining <= p.minRemaining
 +	lowByRatio := ratio <= p.threshold
 +	p.log.Info("prewarm: balance",
 +		"site", site.Code, "remaining", remaining, "limit", limit,
-+		"ratio", strconv.FormatFloat(ratio, 'f', 3, 64),
-+		"low", lowByAbsolute || lowByRatio)
++		"used_pct", strconv.FormatFloat((1-ratio)*100, 'f', 1, 64),
++		"low_abs", lowByAbsolute, "low_ratio", lowByRatio)
 +
 +	if !lowByAbsolute && !lowByRatio {
 +		return
@@ -601,7 +610,7 @@ index 0000000..5cc2b53
 +	// 换完立刻复核一次，把新额度写回缓存
 +	vctx, cancel2 := context.WithTimeout(ctx, 25*time.Second)
 +	if bal2, err := p.c.FetchBalance(vctx, site, p.currentGID(site, route), model.BotID, route); err == nil {
-+		p.c.setQuotaRemaining(site.Code, bal2.Free.Remaining)
++		p.c.setQuotaBalance(site.Code, bal2.Free.Remaining, bal2.Free.Limit)
 +		p.log.Info("prewarm: quota restored",
 +			"site", site.Code, "remaining", bal2.Free.Remaining, "limit", bal2.Free.Limit)
 +	}

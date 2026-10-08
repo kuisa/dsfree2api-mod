@@ -1683,8 +1683,10 @@ func (c *Client) rotateCandidates(ids []string) []string {
 ```yaml
 PREWARM_ENABLED: "true"                  # 总开关
 PREWARM_INTERVAL_SECONDS: "60"           # 后台巡检间隔
-PREWARM_MIN_REMAINING: "10000"           # 额度基线（工作时）
-PREWARM_THRESHOLD: "0.20"                # 额度比例兜底（站点额度非 30000 时有用）
+PREWARM_MIN_REMAINING: "10000"           # 额度绝对值基线（设 0 = 只用比例）
+PREWARM_THRESHOLD: "0.20"                # 剩余比例基线：剩余降到 20%（用满 80%）就刷新，
+                                         # 站点额度是 10000 还是 30000 都适用。
+                                         # 与上面那条是「或」关系，谁先到算谁。
 PREWARM_REFRESH_BEFORE_MINUTES: "30"     # 时效基线提前量（闲置时）
 PREWARM_START_DELAY_SECONDS: "15"        # 启动后延迟，避免和冷启动抢资源
 ```
