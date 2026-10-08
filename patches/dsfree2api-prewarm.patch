@@ -1,0 +1,664 @@
+diff --git a/cmd/dsfree2api/main.go b/cmd/dsfree2api/main.go
+index 127a38e..ee18db1 100644
+--- a/cmd/dsfree2api/main.go
++++ b/cmd/dsfree2api/main.go
+@@ -76,6 +76,12 @@ func main() {
+ 
+ 	ts := turnstile.New(cfg.Turnstile, cfg.Upstream.UserAgent)
+ 	up := upstream.New(cfg, ts, logger)
++
++	// 后台预热：定期查余额、快用尽时提前换访客身份、并保持会话温热，
++	// 这样请求到来时不必现付一次求解/握手成本。
++	prewarmCtx, prewarmCancel := context.WithCancel(context.Background())
++	prewarm := up.StartPrewarm(prewarmCtx)
++
+ 	apiSrv := api.New(cfg, up, met, logs, ts, logger)
+ 	adminSrv := admin.New(cfg, up, met, logs, ts, logger)
+ 
+@@ -129,6 +135,8 @@ func main() {
+ 	if adminHTTP != nil {
+ 		_ = adminHTTP.Shutdown(ctx)
+ 	}
++	prewarmCancel()
++	prewarm.Stop()
+ 	met.Close()
+ 	logger.Info("bye")
+ }
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 65d4bc6..6f7181d 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -10,12 +10,19 @@ services:
+       # Web console listens on 127.0.0.1 by default; expose it to reach it
+       # from outside the container (put a reverse proxy in front of it).
+       ADMIN_HOST: 0.0.0.0
+-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
++      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-kof97boss}
+       TURNSTILE_API_KEY: ${TURNSTILE_API_KEY:-}
+-      API_KEYS: ${API_KEYS:-}
++      API_KEYS: ${API_KEYS:-kof97boss}
+       PROXY_URL: ${PROXY_URL:-}
+       PROXY_FALLBACK_URLS: ${PROXY_FALLBACK_URLS:-}
+       PROXY_SLOW_START_SECONDS: ${PROXY_SLOW_START_SECONDS:-8}
++      # 后台预热：额度基线（工作时）+ 时效基线（闲置时），让客户端无感
++      PREWARM_ENABLED: ${PREWARM_ENABLED:-true}
++      PREWARM_INTERVAL_SECONDS: ${PREWARM_INTERVAL_SECONDS:-60}
++      PREWARM_MIN_REMAINING: ${PREWARM_MIN_REMAINING:-10000}
++      PREWARM_THRESHOLD: ${PREWARM_THRESHOLD:-0.20}
++      PREWARM_REFRESH_BEFORE_MINUTES: ${PREWARM_REFRESH_BEFORE_MINUTES:-30}
++      PREWARM_START_DELAY_SECONDS: ${PREWARM_START_DELAY_SECONDS:-15}
+     volumes:
+       - ./data:/app/data
+       # 先执行: cp config.example.toml config.toml
+diff --git a/internal/api/chat.go b/internal/api/chat.go
+index 0d2c038..50caee9 100644
+--- a/internal/api/chat.go
++++ b/internal/api/chat.go
+@@ -148,7 +148,10 @@ func (s *Server) completeChat(ctx context.Context, w http.ResponseWriter, req op
+ }
+ 
+ func buildCompletion(req openai.ChatCompletionRequest, prompt, body string) *openai.ChatCompletionResponse {
+-	message := openai.ChoiceMessage{Content: body}
++	// Role 必须显式设为 "assistant"：ChoiceMessage.Role 没有 omitempty，
++	// 不赋值就会序列化成 "role": ""，严格的 OpenAI 客户端（Cline/Cursor/
++	// Continue 等）会因为 role 非法直接报错。
++	message := openai.ChoiceMessage{Role: "assistant", Content: body}
+ 	if len(req.Tools) > 0 {
+ 		remaining, calls, ok := openai.TryParseToolCalls(body)
+ 		if ok {
+@@ -301,7 +304,10 @@ func (s *Server) streamChat(ctx context.Context, w http.ResponseWriter, req open
+ 		}},
+ 	}
+ 	deltaPayload := map[string]any{}
+-	if content != "" {
++	// 只有缓冲模式（带工具）才需要在这里补发正文 —— 那种模式下正文没有
++	// 增量发送过。非缓冲模式下正文已经逐块发过了，末帧再发一遍会让客户端
++	// 重复显示整段内容。
++	if content != "" && buffered {
+ 		deltaPayload["content"] = content
+ 	}
+ 	if len(toolCalls) > 0 {
+diff --git a/internal/turnstile/solver.go b/internal/turnstile/solver.go
+index a5982f1..4cab63d 100644
+--- a/internal/turnstile/solver.go
++++ b/internal/turnstile/solver.go
+@@ -217,6 +217,20 @@ func (s *Solver) GuestID(siteCode, proxy string) (string, bool) {
+ 	return gid, gid != ""
+ }
+ 
++// SessionExpiresAt reports when the site's cached verified cookies expire.
++// ok is false when there is no live session. Callers use it to refresh ahead
++// of the TTL (cookie_ttl_seconds) instead of waiting for the cache to lapse.
++func (s *Solver) SessionExpiresAt(siteCode, proxy string) (time.Time, bool) {
++	c := s.coreFor(proxy)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	st, ok := c.cache[siteCode]
++	if !ok || time.Now().After(st.expiresAt) {
++		return time.Time{}, false
++	}
++	return st.expiresAt, true
++}
++
+ // ImportCookies stores cookies exported from a browser session that already
+ // passed the Turnstile check, so chat works while [turnstile] is off or the
+ // solver service is down. Cookies are bound to the IP/UA that obtained them,
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index d068935..a18f5c7 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -14,6 +14,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/nyoungo/dsfree2api/internal/config"
+@@ -54,11 +55,27 @@ type Client struct {
+ 	// quotaCool marks sites that recently answered with quota errors; they
+ 	// are tried after the healthy mirrors until the cooldown expires.
+ 	quotaCool map[string]time.Time
++	// quotaRemaining caches the last observed free-tier remaining per site.
++	// Request-time routing reads it to skip a site that is about to run dry
++	// without paying a balance round-trip on the hot path.
++	quotaRemaining map[string]int
++	// minRemaining is the working baseline (PREWARM_MIN_REMAINING). A site
++	// whose cached free tier falls to or below it is routed around until the
++	// background refresher restores it.
++	minRemaining int
++	// prewarmTrigger lets request-time routing wake the background refresher
++	// for a specific site immediately, instead of waiting for the next tick.
++	prewarmMu      sync.Mutex
++	prewarmTrigger chan string
+ 	// lastWarn* dedupes repeated identical upstream errors so a quota
+ 	// storm cannot drown the log.
+ 	lastWarnMsg string
+ 	lastWarnAt  time.Time
+ 
++	// rr drives round-robin site selection so consecutive requests do not
++	// all start on the same endpoint.
++	rr uint64
++
+ 	// chatOnceOverride is a test seam; nil in production.
+ 	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
+ 		prompt string, route Route, info *ServeInfo, yield func(Event) error) error
+@@ -72,10 +89,12 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger) *Client {
+ 		cfg:       cfg,
+ 		ts:        ts,
+ 		log:       log,
+-		chatCfg:   map[string]chatConfig{},
+-		cfgLocks:  map[string]*sync.Mutex{},
+-		gates:     map[string]chan struct{}{},
+-		quotaCool: map[string]time.Time{},
++		chatCfg:        map[string]chatConfig{},
++		cfgLocks:       map[string]*sync.Mutex{},
++		gates:          map[string]chan struct{}{},
++		quotaCool:      map[string]time.Time{},
++		quotaRemaining: map[string]int{},
++		minRemaining:   envInt(envPrewarmMinRemaining, 10000),
+ 	}
+ }
+ 
+@@ -156,6 +175,21 @@ func (c *Client) sortQuotaCoolLast(ids []string) []string {
+ 	return append(rest, cooled...)
+ }
+ 
++// rotateCandidates round-robins the candidate order. Each call advances a
++// shared counter, so request N starts on a different site than request N-1
++// and the daily free tiers of all mirrors get consumed evenly instead of the
++// requested model's site absorbing every call.
++func (c *Client) rotateCandidates(ids []string) []string {
++	if len(ids) < 2 {
++		return ids
++	}
++	off := int(atomic.AddUint64(&c.rr, 1) % uint64(len(ids)))
++	out := make([]string, 0, len(ids))
++	out = append(out, ids[off:]...)
++	out = append(out, ids[:off]...)
++	return out
++}
++
+ // clearQuotaCool lifts a site's cooldown once it serves again after a quota
+ // error — the fresh visitor identity restored its daily tier.
+ func (c *Client) clearQuotaCool(code string) {
+@@ -170,6 +204,75 @@ func (c *Client) clearQuotaCool(code string) {
+ 	}
+ }
+ 
++// setQuotaRemaining records the last observed free-tier remaining for a site.
++// Called by the balance probe and by the background refresher.
++func (c *Client) setQuotaRemaining(code string, remaining int) {
++	c.stateMu.Lock()
++	c.quotaRemaining[code] = remaining
++	c.stateMu.Unlock()
++}
++
++// quotaRemainingFor returns the cached free tier for a site. The second value
++// is false when the site has never been probed — unknown is not "low".
++func (c *Client) quotaRemainingFor(code string) (int, bool) {
++	c.stateMu.Lock()
++	defer c.stateMu.Unlock()
++	n, ok := c.quotaRemaining[code]
++	return n, ok
++}
++
++// QuotaRemaining exposes the cached reading to the admin console.
++func (c *Client) QuotaRemaining(code string) (int, bool) { return c.quotaRemainingFor(code) }
++
++// setPrewarmTrigger wires the background refresher's wake-up channel.
++func (c *Client) setPrewarmTrigger(ch chan string) {
++	c.prewarmMu.Lock()
++	c.prewarmTrigger = ch
++	c.prewarmMu.Unlock()
++}
++
++// notifyLowQuota asks the background refresher to refresh one site right now.
++// Non-blocking: a full queue means a refresh is already pending for it.
++func (c *Client) notifyLowQuota(site string) {
++	c.prewarmMu.Lock()
++	ch := c.prewarmTrigger
++	c.prewarmMu.Unlock()
++	if ch == nil {
++		return
++	}
++	select {
++	case ch <- site:
++	default:
++	}
++}
++
++// sortLowQuotaLast moves sites whose cached free tier has dropped to (or below)
++// the working baseline behind the healthy mirrors. That is what makes the
++// switch seamless: a request arriving while a site is being refreshed in the
++// background simply lands on a full one instead of waiting or failing.
++func (c *Client) sortLowQuotaLast(ids []string) []string {
++	if c.minRemaining <= 0 || len(ids) < 2 {
++		return ids
++	}
++	var low, rest []string
++	for _, id := range ids {
++		m, ok := c.modelCopy(id)
++		if ok {
++			if n, seen := c.quotaRemainingFor(m.Site); seen && n <= c.minRemaining {
++				low = append(low, id)
++				// 被换下的站点立刻推给后台刷新，不等下一轮巡检
++				c.notifyLowQuota(m.Site)
++				continue
++			}
++		}
++		rest = append(rest, id)
++	}
++	if len(low) == 0 {
++		return ids
++	}
++	return append(rest, low...)
++}
++
+ // probeBalanceAsync logs the site's current free tier after a quota
+ // recovery. Best effort — failures only show up at DEBUG.
+ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route Route) {
+@@ -190,6 +293,8 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
+ 		}
+ 		c.log.Info("site balance", "site", site.Code,
+ 			"remaining", bal.Free.Remaining, "limit", bal.Free.Limit)
++		// 回填缓存，供后续请求做零延迟路由判断
++		c.setQuotaRemaining(site.Code, bal.Free.Remaining)
+ 	}()
+ }
+ 
+@@ -256,10 +361,18 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
+ 			candidates = append(candidates, alt)
+ 		}
+ 	}
++	// Round-robin the candidates so consecutive requests do not all start on
++	// the same endpoint. Without this the requested model always won and a
++	// single site absorbed every call until its daily tier ran dry.
++	candidates = c.rotateCandidates(candidates)
+ 	// A site that recently reported quota errors keeps being tried, but
+ 	// behind the healthy mirrors — continuation rounds stop paying its
+ 	// refresh tax while its balance is empty.
+ 	candidates = c.sortQuotaCoolLast(candidates)
++	// Working baseline: a site whose cached free tier has dropped to
++	// PREWARM_MIN_REMAINING is routed around at request time, so the switch
++	// happens before the request instead of after a quota failure.
++	candidates = c.sortLowQuotaLast(candidates)
+ 
+ 	var last error
+ 	triedPrimary := false
+diff --git a/internal/upstream/prewarm.go b/internal/upstream/prewarm.go
+new file mode 100644
+index 0000000..5cc2b53
+--- /dev/null
++++ b/internal/upstream/prewarm.go
+@@ -0,0 +1,370 @@
++package upstream
++
++import (
++	"context"
++	"log/slog"
++	"math/rand"
++	"os"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/nyoungo/dsfree2api/internal/config"
++)
++
++// ── 后台预热（Prewarm） ──────────────────────────────────────────
++//
++// 目标：客户端**无感**。两条基线各管一种场景：
++//
++//	工作时（额度基线）
++//	  单站免费额度上限 30000，以 PREWARM_MIN_REMAINING（默认 10000，即用掉
++//	  20000）为基线。请求进来时用**缓存**的额度做路由判断（不走网络，不增加
++//	  延迟）：跌到基线的站点被排到最后，请求落到还有余额的镜像上；同时立刻
++//	  唤醒后台去刷新那个站点，换新访客身份把额度重置回满。
++//
++//	闲置时（时效基线）
++//	  会话 cookie 有效期 cookie_ttl_seconds（默认 10800s = 180 分钟）。以
++//	  PREWARM_REFRESH_BEFORE_MINUTES（默认 30）为提前量，即存活满 150 分钟
++//	  就主动刷新，而不是等它过期后由第一个请求现付一次求解成本。
++//
++// 全部用环境变量控制，默认开启：
++//
++//	PREWARM_ENABLED=true
++//	PREWARM_INTERVAL_SECONDS=60        后台巡检间隔
++//	PREWARM_MIN_REMAINING=10000        额度基线（工作时）
++//	PREWARM_THRESHOLD=0.20             额度比例基线（兜底，站点额度非 30000 时有用）
++//	PREWARM_REFRESH_BEFORE_MINUTES=30  时效基线提前量（闲置时）
++//	PREWARM_START_DELAY_SECONDS=15
++
++const (
++	envPrewarmEnabled       = "PREWARM_ENABLED"
++	envPrewarmInterval      = "PREWARM_INTERVAL_SECONDS"
++	envPrewarmMinRemaining  = "PREWARM_MIN_REMAINING"
++	envPrewarmThreshold     = "PREWARM_THRESHOLD"
++	envPrewarmRefreshBefore = "PREWARM_REFRESH_BEFORE_MINUTES"
++	envPrewarmDelay         = "PREWARM_START_DELAY_SECONDS"
++)
++
++// Prewarm is the background session/quota keeper.
++type Prewarm struct {
++	c             *Client
++	log           *slog.Logger
++	interval      time.Duration
++	minRemaining  int
++	threshold     float64
++	refreshBefore time.Duration
++	startDelay    time.Duration
++
++	trigger chan string // 请求路径发现额度见底时唤醒，立刻刷新该站点
++	stop    chan struct{}
++	done    chan struct{}
++
++	mu        sync.Mutex
++	inflight  map[string]bool
++}
++
++func envBool(key string, def bool) bool {
++	v := strings.TrimSpace(os.Getenv(key))
++	if v == "" {
++		return def
++	}
++	b, err := strconv.ParseBool(v)
++	if err != nil {
++		return def
++	}
++	return b
++}
++
++func envInt(key string, def int) int {
++	v := strings.TrimSpace(os.Getenv(key))
++	if v == "" {
++		return def
++	}
++	n, err := strconv.Atoi(v)
++	if err != nil || n < 0 {
++		return def
++	}
++	return n
++}
++
++func envFloat(key string, def float64) float64 {
++	v := strings.TrimSpace(os.Getenv(key))
++	if v == "" {
++		return def
++	}
++	f, err := strconv.ParseFloat(v, 64)
++	if err != nil || f <= 0 || f > 1 {
++		return def
++	}
++	return f
++}
++
++// StartPrewarm launches the background loop. Returns nil when disabled, so
++// callers can defer Stop() safely after a nil check.
++func (c *Client) StartPrewarm(ctx context.Context) *Prewarm {
++	if !envBool(envPrewarmEnabled, true) {
++		c.log.Info("prewarm disabled")
++		return nil
++	}
++	p := &Prewarm{
++		c:             c,
++		log:           c.log,
++		interval:      time.Duration(envInt(envPrewarmInterval, 60)) * time.Second,
++		minRemaining:  envInt(envPrewarmMinRemaining, 10000),
++		threshold:     envFloat(envPrewarmThreshold, 0.20),
++		refreshBefore: time.Duration(envInt(envPrewarmRefreshBefore, 30)) * time.Minute,
++		startDelay:    time.Duration(envInt(envPrewarmDelay, 15)) * time.Second,
++		trigger:       make(chan string, 8),
++		stop:          make(chan struct{}),
++		done:          make(chan struct{}),
++		inflight:      map[string]bool{},
++	}
++	// 让请求路径能把"这个站点额度见底了"推给后台
++	c.setPrewarmTrigger(p.trigger)
++	go p.loop(ctx)
++	c.log.Info("prewarm started",
++		"interval", p.interval,
++		"min_remaining", p.minRemaining,
++		"refresh_before", p.refreshBefore,
++		"start_delay", p.startDelay)
++	return p
++}
++
++// Stop ends the loop and waits for it to return.
++func (p *Prewarm) Stop() {
++	if p == nil {
++		return
++	}
++	select {
++	case <-p.stop:
++		return
++	default:
++	}
++	close(p.stop)
++	<-p.done
++}
++
++func (p *Prewarm) loop(ctx context.Context) {
++	defer close(p.done)
++	timer := time.NewTimer(p.startDelay)
++	defer timer.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-p.stop:
++			return
++		case <-timer.C:
++			p.tick(ctx)
++			jitter := time.Duration(rand.Int63n(int64(p.interval/5) + 1))
++			timer.Reset(p.interval + jitter)
++		case site := <-p.trigger:
++			// 请求路径发现这个站点额度见底 → 立刻刷新，不等下一轮巡检
++			if !p.begin(site) {
++				continue
++			}
++			p.refreshSite(ctx, site)
++			p.end(site)
++		}
++	}
++}
++
++// begin/end dedupe concurrent refresh requests for the same site.
++func (p *Prewarm) begin(site string) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.inflight[site] {
++		return false
++	}
++	p.inflight[site] = true
++	return true
++}
++
++func (p *Prewarm) end(site string) {
++	p.mu.Lock()
++	delete(p.inflight, site)
++	p.mu.Unlock()
++}
++
++func (p *Prewarm) tick(ctx context.Context) {
++	for _, sm := range p.c.siteModels() {
++		select {
++		case <-ctx.Done():
++			return
++		case <-p.stop:
++			return
++		default:
++		}
++		if !p.begin(sm.site.Code) {
++			continue
++		}
++		p.warmSite(ctx, sm.site, sm.model)
++		p.end(sm.site.Code)
++	}
++}
++
++func (p *Prewarm) refreshSite(ctx context.Context, code string) {
++	for _, sm := range p.c.siteModels() {
++		if sm.site.Code == code {
++			p.log.Info("prewarm: request-time trigger, refreshing now", "site", code)
++			p.warmSite(ctx, sm.site, sm.model)
++			return
++		}
++	}
++}
++
++// warmSite ensures one site has a fresh session and enough free tier.
++func (p *Prewarm) warmSite(ctx context.Context, site config.Site, model config.Model) {
++	if p.c.ts == nil {
++		return
++	}
++	routes := p.c.Routes()
++	if len(routes) == 0 {
++		return
++	}
++	route := routes[0]
++
++	// 和真实请求共用同一个并发闸门，避免预热把站点打爆
++	actx, cancelAcquire := context.WithTimeout(ctx, 30*time.Second)
++	defer cancelAcquire()
++	if err := p.c.acquire(actx, site.Code); err != nil {
++		p.log.Debug("prewarm: site busy, skip", "site", site.Code)
++		return
++	}
++	defer p.c.release(site.Code)
++
++	gid, hasSession := p.c.ts.GuestID(site.Code, route.Proxy)
++	expiresAt, hasExpiry := p.c.ts.SessionExpiresAt(site.Code, route.Proxy)
++
++	// ── 时效基线（闲置时）──────────────────────────────────────
++	// 会话将在 refreshBefore 内过期 → 主动刷新，别等第一个请求现付求解成本
++	if !hasSession {
++		p.log.Info("prewarm: no session, refreshing", "site", site.Code)
++		if !p.refresh(ctx, site, model, route) {
++			return
++		}
++		gid, hasSession = p.c.ts.GuestID(site.Code, route.Proxy)
++		if !hasSession {
++			return
++		}
++	} else if hasExpiry {
++		left := time.Until(expiresAt)
++		if left <= p.refreshBefore {
++			p.log.Info("prewarm: session nearing TTL, refreshing",
++				"site", site.Code, "left", left.Round(time.Second))
++			if !p.refresh(ctx, site, model, route) {
++				return
++			}
++			gid, hasSession = p.c.ts.GuestID(site.Code, route.Proxy)
++			if !hasSession {
++				return
++			}
++		}
++	}
++
++	// ── 额度基线（工作时）──────────────────────────────────────
++	bctx, cancel := context.WithTimeout(ctx, 25*time.Second)
++	bal, err := p.c.FetchBalance(bctx, site, gid, model.BotID, route)
++	cancel()
++	if err != nil {
++		p.log.Debug("prewarm: balance probe failed", "site", site.Code, "error", err)
++		return
++	}
++	limit := bal.Free.Limit
++	remaining := bal.Free.Remaining
++	if limit <= 0 {
++		return
++	}
++	// 刷新缓存，供请求路径做零延迟路由判断
++	p.c.setQuotaRemaining(site.Code, remaining)
++
++	ratio := float64(remaining) / float64(limit)
++	lowByAbsolute := p.minRemaining > 0 && remaining <= p.minRemaining
++	lowByRatio := ratio <= p.threshold
++	p.log.Info("prewarm: balance",
++		"site", site.Code, "remaining", remaining, "limit", limit,
++		"ratio", strconv.FormatFloat(ratio, 'f', 3, 64),
++		"low", lowByAbsolute || lowByRatio)
++
++	if !lowByAbsolute && !lowByRatio {
++		return
++	}
++
++	// 跌到基线 → 换访客身份（新身份自带一份全新的每日额度）
++	p.log.Info("prewarm: quota at baseline, rotating visitor identity",
++		"site", site.Code, "remaining", remaining, "baseline", p.minRemaining)
++	if newGID := p.c.ts.RotateGuest(site.Code); newGID != "" {
++		p.c.clearQuotaCool(site.Code)
++		p.log.Info("prewarm: rotated visitor identity", "site", site.Code)
++	} else {
++		// 没有缓存会话可换 → 走完整刷新（会重新过 Turnstile）
++		if !p.refresh(ctx, site, model, route) {
++			return
++		}
++	}
++	// 换完立刻复核一次，把新额度写回缓存
++	vctx, cancel2 := context.WithTimeout(ctx, 25*time.Second)
++	if bal2, err := p.c.FetchBalance(vctx, site, p.currentGID(site, route), model.BotID, route); err == nil {
++		p.c.setQuotaRemaining(site.Code, bal2.Free.Remaining)
++		p.log.Info("prewarm: quota restored",
++			"site", site.Code, "remaining", bal2.Free.Remaining, "limit", bal2.Free.Limit)
++	}
++	cancel2()
++}
++
++func (p *Prewarm) currentGID(site config.Site, route Route) string {
++	if gid, ok := p.c.ts.GuestID(site.Code, route.Proxy); ok {
++		return gid
++	}
++	return ""
++}
++
++// refresh runs a full session refresh (Turnstile solve + verify). Returns
++// false when it failed, so the caller stops instead of probing a dead session.
++func (p *Prewarm) refresh(ctx context.Context, site config.Site, model config.Model, route Route) bool {
++	rctx, cancel := context.WithTimeout(ctx, 90*time.Second)
++	defer cancel()
++	if err := p.c.refreshSession(rctx, site, model.ID, route, true); err != nil {
++		p.log.Warn("prewarm: session refresh failed", "site", site.Code, "error", err)
++		return false
++	}
++	p.log.Info("prewarm: session refreshed", "site", site.Code)
++	return true
++}
++
++// siteModels returns one (site, model) pair per enabled site, picking the
++// lowest bot_id (usually the flash tier) so the balance probe measures the
++// same free tier a normal request would consume.
++func (c *Client) siteModels() []siteModel {
++	c.cfg.RLock()
++	defer c.cfg.RUnlock()
++
++	bySite := map[string]config.Model{}
++	for _, m := range c.cfg.Models {
++		if m == nil || !m.Enabled {
++			continue
++		}
++		s, ok := c.cfg.Sites[m.Site]
++		if !ok || s == nil || !s.Enabled {
++			continue
++		}
++		if prev, seen := bySite[m.Site]; !seen || m.BotID < prev.BotID {
++			bySite[m.Site] = *m
++		}
++	}
++	out := make([]siteModel, 0, len(bySite))
++	for code, m := range bySite {
++		if s, ok := c.cfg.Sites[code]; ok && s != nil {
++			out = append(out, siteModel{site: *s, model: m})
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].site.Code < out[j].site.Code })
++	return out
++}
++
++type siteModel struct {
++	site  config.Site
++	model config.Model
++}
