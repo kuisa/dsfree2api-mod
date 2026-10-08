@@ -4,7 +4,7 @@ import json
 import urllib.request
 
 BASE = "http://127.0.0.1:8002/v1"
-KEY = "kof97boss"
+KEY = "your-apikey"
 H = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 
