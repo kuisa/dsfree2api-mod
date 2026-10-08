@@ -17,8 +17,8 @@ bash deploy.sh
 或者克隆下来跑（会优先用仓库里的文件，不走网络）：
 
 ```bash
-git clone https://github.com/YOURNAME/turnstile-solver.git
-cd turnstile-solver
+git clone https://github.com/kuisa/dsfree2api-mod.git
+cd dsfree2api-mod
 bash deploy.sh
 ```
 
