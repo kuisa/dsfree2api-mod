@@ -41,10 +41,10 @@ SOLVER_DIR="$BASE_DIR/solver"
 
 # dsfree2api 源码 + 补丁对应的 commit（补丁必须打在同一个版本上）
 DSFREE_REPO="${DSFREE_REPO:-https://github.com/nyoungo/dsfree2api.git}"
-DSFREE_COMMIT="${DSFREE_COMMIT:-4cc4504a1864f85dd07247cff0003f75159b6809}"
+DSFREE_COMMIT="${DSFREE_COMMIT:-e44e960fe91baf01cfc578d62dce4185eacb6f2b}"
 
 # 本仓库的 raw 地址（脚本不是从仓库里跑时需要）
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/YOURNAME/turnstile-solver/main}"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/kuisa/dsfree2api-mod/main}"
 
 # 预热参数
 PREWARM_MIN_REMAINING="${PREWARM_MIN_REMAINING:-10000}"
@@ -394,7 +394,9 @@ else
     if git -C "$DSFREE_DIR" apply --reverse --check /tmp/dsfree2api-prewarm.patch 2>/dev/null; then
       ok "补丁已在（跳过）"
     else
-      die "补丁应用失败。源码版本不对，或已被本地修改。请手动检查 $DSFREE_DIR"
+      die "补丁应用失败。当前源码版本 $(git -C "$DSFREE_DIR" rev-parse --short HEAD)，
+     补丁是针对 $DSFREE_COMMIT 生成的。上游改过代码了 → 把 DSFREE_COMMIT 换成
+     补丁对应的版本，或重新生成补丁（见 README「补丁会随上游漂移」一节）。"
     fi
   fi
 fi
