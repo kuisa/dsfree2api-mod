@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """模拟真实客户端（Cline/Cursor 那种）的完整工具调用往返"""
 import json
+import os
 import urllib.request
 
-BASE = "http://127.0.0.1:8002/v1"
-H = {"Authorization": "Bearer your-apikey", "Content-Type": "application/json"}
+BASE = os.environ.get("BASE", "http://127.0.0.1:8002/v1")
+H = {"Authorization": f"Bearer {os.environ.get('API_KEY', 'your-apikey')}",
+     "Content-Type": "application/json"}
 
 
 def chat(body, timeout=180):

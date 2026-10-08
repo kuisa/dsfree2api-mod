@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """实测 :8002 代理对各种客户端场景的兼容性"""
 import json
+import os
 import urllib.request
 
-BASE = "http://127.0.0.1:8002/v1"
-KEY = "your-apikey"
+BASE = os.environ.get("BASE", "http://127.0.0.1:8002/v1")
+KEY = os.environ.get("API_KEY", "your-apikey")
 H = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 

@@ -213,7 +213,7 @@ curl -s http://127.0.0.1:8002/health
 | `SOLVER_KEY` | 自动生成 | 求解器自身 key |
 | `SITEKEY` / `ACTION` | 见脚本 | 目标站点的 Turnstile 参数 |
 | `BASE_DIR` | `/opt/turnstile-stack` | 安装目录 |
-| `DSFREE_COMMIT` | `4cc4504` | 补丁对应的版本（别乱改） |
+| `DSFREE_COMMIT` | `e44e960` | 补丁对应的版本（v0.6.3，别乱改）。**这个版本才含三个工具调用修复**（prose 前缀 JSON、DSML 标记、流式参数），老版本（≤v0.6.0）复杂工具调用会退化成纯文本 |
 | `PREWARM_MIN_REMAINING` | `10000` | 额度绝对值基线（设 0 = 关闭这条，只用比例） |
 | `PREWARM_THRESHOLD` | `0.20` | 剩余比例基线：剩余降到 limit 的 20%（= 用满 80%）就刷新。**站点额度是 10000 还是 30000 都适用** |
 | `PREWARM_REFRESH_BEFORE_MINUTES` | `30` | 时效提前量 |
