@@ -17,8 +17,8 @@ bash deploy.sh
 或者克隆下来跑（会优先用仓库里的文件，不走网络）：
 
 ```bash
-git clone https://github.com/kuisa/dsfree2api-mod.git
-cd dsfree2api-mod
+git clone https://github.com/YOURNAME/turnstile-solver.git
+cd turnstile-solver
 bash deploy.sh
 ```
 
@@ -134,15 +134,47 @@ Authorization: Bearer {api_key}
 
 **客户端只要把 base_url 指到 `:8002`，就自动有联网搜索**，不用改任何其他配置。
 
-### 搜索后端
+### 搜索后端：用环境变量换，不用改代码
 
-按顺序自动降级，全部免费无需 key：
+```bash
+sudo systemctl edit search-proxy      # 或者直接改 /etc/systemd/system/search-proxy.service
+# 加一行：
+Environment=SEARCH_BACKENDS=tavily,bing,duckduckgo,wikipedia
+sudo systemctl daemon-reload && sudo systemctl restart search-proxy
+```
 
-| 顺序 | 后端 | 说明 |
+逗号分隔，**靠前的先用**，失败自动降级到下一个。
+
+| 后端名 | 要不要 key | 说明 |
 |---|---|---|
-| 1 | **Bing** | 主后端，中文结果好 |
-| 2 | **DuckDuckGo** | 备用（必须用 GET，POST 会被反爬拦成 202） |
-| 3 | **Wikipedia** | 兜底，只覆盖百科类 |
+| `bing` | 免费 | 默认主力，中文结果好 |
+| `duckduckgo` | 免费 | 备用。**必须用 GET**，POST 会被反爬拦成 202 |
+| `wikipedia` | 免费 | 兜底，只覆盖百科类 |
+| `tavily` | 要 `TAVILY_API_KEY` | 质量最好，免费 1000 次/月 |
+| `brave` | 要 `BRAVE_API_KEY` | 免费 2000 次/月 |
+| `serper` | 要 `SERPER_API_KEY` | Google 结果，免费 2500 次 |
+
+付费后端**没配 key 会自动跳过**，所以你可以把 `tavily` 放在最前面 —— 有 key 就用它，
+没 key 自动落到 `bing`，不用改配置。
+
+要填 key 就在同一个 unit 里加：
+
+```ini
+Environment=TAVILY_API_KEY=tvly-xxxxxxxx
+```
+
+验证当前生效的后端：
+
+```bash
+curl -s http://127.0.0.1:8002/health
+# {"backends": ["bing", "duckduckgo", "wikipedia"], ...}
+```
+
+启动日志里也会打印：
+
+```
+[PROXY]   搜索后端  : bing → duckduckgo → wikipedia
+```
 
 > **注意**：如果你的出口 IP 是 WARP / 数据中心 IP，DuckDuckGo 和多数公共 SearXNG
 > 实例会拦（返回 "anomaly" / "not a bot" 页面）。Bing 目前不拦。

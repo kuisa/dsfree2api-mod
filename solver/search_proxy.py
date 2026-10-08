@@ -223,15 +223,107 @@ def search_wikipedia(query, n):
     return out
 
 
-BACKENDS = (
-    ("bing", search_bing),
-    ("duckduckgo", search_ddg),
-    ("wikipedia", search_wikipedia),
-)
+def search_tavily(query, n):
+    """Tavily API（需 TAVILY_API_KEY，免费额度 1000 次/月，质量最好）"""
+    key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not key:
+        return []
+    status, _, raw = http_request(
+        "https://api.tavily.com/search",
+        data={"api_key": key, "query": query, "max_results": n,
+              "search_depth": "basic", "include_answer": False},
+        headers={"Content-Type": "application/json"},
+        timeout=SEARCH_TIMEOUT,
+    )
+    if status != 200:
+        log(f"tavily http {status}: {raw[:150].decode('utf-8', 'ignore')}")
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    return [{"title": r.get("title") or "", "url": r.get("url") or "",
+             "snippet": r.get("content") or ""}
+            for r in (data.get("results") or [])[:n] if r.get("url")]
+
+
+def search_brave(query, n):
+    """Brave Search API（需 BRAVE_API_KEY，免费 2000 次/月）"""
+    key = os.getenv("BRAVE_API_KEY", "").strip()
+    if not key:
+        return []
+    url = "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(
+        {"q": query, "count": str(n)})
+    status, _, raw = http_request(
+        url,
+        headers={"Accept": "application/json", "X-Subscription-Token": key},
+        timeout=SEARCH_TIMEOUT,
+    )
+    if status != 200:
+        log(f"brave http {status}: {raw[:150].decode('utf-8', 'ignore')}")
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    out = []
+    for r in ((data.get("web") or {}).get("results") or [])[:n]:
+        if not r.get("url"):
+            continue
+        out.append({"title": r.get("title") or "", "url": r["url"],
+                    "snippet": r.get("description") or ""})
+    return out
+
+
+def search_serper(query, n):
+    """Serper.dev（Google 结果，需 SERPER_API_KEY，免费 2500 次）"""
+    key = os.getenv("SERPER_API_KEY", "").strip()
+    if not key:
+        return []
+    status, _, raw = http_request(
+        "https://google.serper.dev/search",
+        data={"q": query, "num": n},
+        headers={"Content-Type": "application/json", "X-API-KEY": key},
+        timeout=SEARCH_TIMEOUT,
+    )
+    if status != 200:
+        log(f"serper http {status}: {raw[:150].decode('utf-8', 'ignore')}")
+        return []
+    try:
+        data = json.loads(raw.decode("utf-8", "ignore"))
+    except Exception:
+        return []
+    return [{"title": r.get("title") or "", "url": r.get("link") or "",
+             "snippet": r.get("snippet") or ""}
+            for r in (data.get("organic") or [])[:n] if r.get("link")]
+
+
+ALL_BACKENDS = {
+    "bing": search_bing,
+    "duckduckgo": search_ddg,
+    "wikipedia": search_wikipedia,
+    "tavily": search_tavily,
+    "brave": search_brave,
+    "serper": search_serper,
+}
+
+# 顺序和启用由 SEARCH_BACKENDS 控制（逗号分隔，靠前的先用）。
+# 付费后端（tavily/brave/serper）没配对应 API Key 时会自动返回空、跳过。
+# 例：SEARCH_BACKENDS=tavily,bing,duckduckgo,wikipedia
+_sel = os.getenv("SEARCH_BACKENDS", "bing,duckduckgo,wikipedia")
+BACKENDS = []
+for _name in _sel.split(","):
+    _name = _name.strip().lower()
+    if _name in ALL_BACKENDS:
+        BACKENDS.append((_name, ALL_BACKENDS[_name]))
+    elif _name:
+        log(f"警告: SEARCH_BACKENDS 里有未知后端 {_name!r}，已忽略")
+if not BACKENDS:
+    BACKENDS = [("bing", search_bing), ("duckduckgo", search_ddg)]
 
 
 def web_search(query, n=None):
-    """按顺序试各后端，返回 (结果列表, 用的后端名)"""
+    """按 SEARCH_BACKENDS 的顺序试各后端，返回 (结果列表, 用的后端名)"""
     n = n or SEARCH_RESULTS
     for name, fn in BACKENDS:
         try:
@@ -468,7 +560,8 @@ class Handler(BaseHTTPRequestHandler):
                                          "upstream": UPSTREAM_URL,
                                          "tool": TOOL_NAME,
                                          "auto_inject": AUTO_INJECT_TOOL,
-                                         "multi_hop": MULTI_HOP})
+                                         "multi_hop": MULTI_HOP,
+                                         "backends": [n for n, _ in BACKENDS]})
         if not self._auth_ok():
             return self._send_json(401, {"error": {"message": "invalid api key"}})
         # 其余 GET 透传（如 /v1/models）
@@ -576,6 +669,7 @@ def main():
     log(f"联网搜索代理启动 http://{LISTEN_HOST}:{LISTEN_PORT}")
     log(f"  上游      : {UPSTREAM_URL}")
     log(f"  工具名    : {TOOL_NAME}  (自动注入: {AUTO_INJECT_TOOL}, 多轮: {MULTI_HOP})")
+    log(f"  搜索后端  : {' → '.join(n for n, _ in BACKENDS)}")
     log(f"  客户端把 base_url 指到 http://<本机IP>:{LISTEN_PORT}/v1 即可")
     try:
         srv.serve_forever()

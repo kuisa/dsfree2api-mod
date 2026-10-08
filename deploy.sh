@@ -531,6 +531,14 @@ Environment=UPSTREAM_URL=http://127.0.0.1:8000
 Environment=API_KEY=$API_KEY
 Environment=AUTO_INJECT_TOOL=true
 Environment=MULTI_HOP=false
+# 搜索后端顺序（逗号分隔，靠前的先用）。可选：
+#   bing / duckduckgo / wikipedia  ← 免费，无需 key
+#   tavily / brave / serper        ← 需在下面填对应 API Key
+Environment=SEARCH_BACKENDS=bing,duckduckgo,wikipedia
+# 付费后端（可选，填了就自动优先用，质量更稳）：
+#Environment=TAVILY_API_KEY=
+#Environment=BRAVE_API_KEY=
+#Environment=SERPER_API_KEY=
 ExecStart=/usr/bin/python3 -u $SOLVER_DIR/search_proxy.py
 Restart=always
 RestartSec=5
