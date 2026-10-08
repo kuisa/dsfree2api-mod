@@ -230,6 +230,49 @@ tail -f /root/turnstile_server.log           # 求解器日志
 cd /opt/turnstile-stack/dsfree2api && docker compose logs -f
 ```
 
+## 改 API Key / 管理台密码
+
+**必须两处一起改**，否则搜索代理会拿旧 key 去调上游，返回 401。
+
+```bash
+cd /opt/turnstile-stack/dsfree2api
+
+# ① 改 .env（compose 读这个，优先级高于 config.toml）
+nano .env
+#   API_KEYS=你的新key
+#   ADMIN_PASSWORD=你的新密码
+
+# ② config.toml 改成同样的值（管理台页面显示的是这个）
+nano config.toml
+#   [security] api_keys = ["你的新key"]
+#   [admin]    password = "你的新密码"
+
+# ③ 重建容器（restart 不重新解析 bind mount，改了不生效）
+docker compose up -d --force-recreate
+
+# ④ 同步 key 到搜索代理（这步最容易漏！）
+KEY=$(grep '^API_KEYS=' /opt/turnstile-stack/dsfree2api/.env | cut -d= -f2-)
+sed -i "s|^Environment=API_KEY=.*|Environment=API_KEY=$KEY|" \
+  /etc/systemd/system/search-proxy.service
+systemctl daemon-reload
+systemctl restart search-proxy
+
+# ⑤ 验证
+curl -s -X POST http://127.0.0.1:8001/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password":"你的新密码"}'
+# 期望 {"ok":true}
+
+curl -s --max-time 180 -X POST http://127.0.0.1:8002/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4-flash-de","messages":[{"role":"user","content":"说 ok"}],"max_tokens":20}'
+```
+
+**顺序很重要**：先重建容器（让 `:8000` 认新 key）→ 再改搜索代理 → 再重启代理。
+反过来会让搜索代理拿新 key 去调还在用旧 key 的 `:8000`，照样 401。
+
+> `/root/.turnstile_solver_key` 是求解器**内部**的 key，跟这两个不是一回事，不用改。
+
 ## 四个必踩的坑
 
 1. **容器内不能填 `127.0.0.1`** —— 那是容器自己。必须用网桥网关 IP（脚本会自动探测）。
