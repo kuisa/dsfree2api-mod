@@ -4,7 +4,7 @@ import json
 import urllib.request
 
 BASE = "http://127.0.0.1:8002/v1"
-H = {"Authorization": "Bearer kof97boss", "Content-Type": "application/json"}
+H = {"Authorization": "Bearer your-apikey", "Content-Type": "application/json"}
 
 
 def chat(body, timeout=180):
