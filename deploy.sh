@@ -44,7 +44,7 @@ DSFREE_REPO="${DSFREE_REPO:-https://github.com/nyoungo/dsfree2api.git}"
 DSFREE_COMMIT="${DSFREE_COMMIT:-4cc4504a1864f85dd07247cff0003f75159b6809}"
 
 # 本仓库的 raw 地址（脚本不是从仓库里跑时需要）
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/YOURNAME/turnstile-solver/main}"
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/kuisa/dsfree2api-mod/main}"
 
 # 预热参数
 PREWARM_MIN_REMAINING="${PREWARM_MIN_REMAINING:-10000}"
