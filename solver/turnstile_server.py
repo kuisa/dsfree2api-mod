@@ -5,7 +5,7 @@ Turnstile 求解服务 —— 包装本地 SeleniumBase 抓取脚本
 
 适配 dsfree2api 的「方式 1：求解服务 API」协议（internal/turnstile/solver.go）：
     单个同步 POST 到你配置的 api_url（不追加任何路径），
-    Header: Authorization: Bearer <api_key>
+    Header: Authorization: Bearer ***
     Body  : {"url","sitekey","action","cdata","timeoutSeconds"}
     应答  : {"errorId":0,"status":"ready","solution":{"token":"1.xxx"}}
 
@@ -107,12 +107,19 @@ class TurnstileSolver:
             headed=True,
             headless=False,
             xvfb=False,          # 用系统 Xvfb :1；换无 Xvfb 的机器时改 True
-            locale=LOCALE,
+            # locale 参数名在不同 seleniumbase 版本间不一致（4.30.0 已移除），
+            # 有就传、没有就跳过，保证 x86 / ARM 都能跑。
             chromium_arg="--no-sandbox,--disable-dev-shm-usage,--window-position=0,0,--start-maximized",
             proxy=PROXY_URL if PROXY_URL else None,
         )
         if FORCE_UA:
             kwargs["agent"] = FORCE_UA
+        try:
+            import inspect as _inspect
+            if "locale" in _inspect.signature(SB.__init__).parameters:
+                kwargs["locale"] = LOCALE
+        except Exception:
+            pass
 
         with SB(**kwargs) as sb:
             sb.uc_open_with_reconnect(url, reconnect_time=10)
