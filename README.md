@@ -10,7 +10,7 @@
 在干净的 Debian 12/13 或 Ubuntu 22.04+ VPS 上：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOURNAME/turnstile-solver/main/deploy.sh -o deploy.sh
+curl -fsSL https://raw.githubusercontent.com/kuisa/dsfree2api-mod/main/deploy.sh -o deploy.sh
 bash deploy.sh
 ```
 
