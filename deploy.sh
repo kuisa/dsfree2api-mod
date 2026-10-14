@@ -41,7 +41,7 @@ SOLVER_DIR="$BASE_DIR/solver"
 
 # dsfree2api 源码 + 补丁对应的 commit（补丁必须打在同一个版本上）
 DSFREE_REPO="${DSFREE_REPO:-https://github.com/nyoungo/dsfree2api.git}"
-DSFREE_COMMIT="${DSFREE_COMMIT:-e44e960fe91baf01cfc578d62dce4185eacb6f2b}"
+DSFREE_COMMIT="${DSFREE_COMMIT:-0e97f303b81db58e606674db3045178619e9040c}"   # v0.6.6
 
 # 本仓库的 raw 地址（脚本不是从仓库里跑时需要）
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/kuisa/dsfree2api-mod/main}"
@@ -190,7 +190,8 @@ else
       apt-get install -y -qq chromium || apt-get install -y -qq chromium-browser || die "Chromium 安装失败"
     fi
     # SeleniumBase 只探测 google-chrome 系列路径，做个软链让它找到
-    CHROME_BIN="$(command -v chromium || command -v chromium-browser)"
+    CHROME_BIN="$(command -v chromium || command -v chromium-browser || true)"
+    [ -n "$CHROME_BIN" ] || die "找不到 chromium 可执行文件"
     [ -e /usr/bin/google-chrome ] || ln -sf "$CHROME_BIN" /usr/bin/google-chrome
     ok "Chromium: $CHROME_BIN（已软链到 /usr/bin/google-chrome）"
   fi
@@ -328,7 +329,7 @@ EOF
   ok "看门狗单元已写入（每 2 分钟）"
 
   systemctl daemon-reload
-  pkill -f "turnstile_server.py" 2>/dev/null || true
+  pkill -f "turnstile_serve[r].py" 2>/dev/null || true
   sleep 1
   systemctl enable --now turnstile-solver.service >/dev/null 2>&1
   systemctl enable --now turnstile-healthcheck.timer >/dev/null 2>&1
@@ -373,7 +374,8 @@ else
   fi
 
   # 4.2 切到补丁对应的 commit（补丁不能跨版本打）
-  CURRENT="$(git -C "$DSFREE_DIR" rev-parse HEAD)"
+  CURRENT="$(git -C "$DSFREE_DIR" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$CURRENT" ] || die "$DSFREE_DIR 不是有效的 git 仓库"
   if [ "$CURRENT" != "$DSFREE_COMMIT" ]; then
     warn "切换到 $DSFREE_COMMIT"
     git -C "$DSFREE_DIR" checkout -q "$DSFREE_COMMIT" 2>/dev/null \
@@ -483,10 +485,10 @@ PYEOF
   sleep 6
 
   # 4.9 探测网桥网关（容器里看到的"宿主"地址）
-  CONTAINER="$(docker compose ps -q 2>/dev/null | head -1)"
+  CONTAINER="$(docker compose ps -q 2>/dev/null | head -1 || true)"
   [ -n "$CONTAINER" ] || die "容器没起来，看 docker compose logs"
-  CNAME="$(docker inspect "$CONTAINER" --format '{{.Name}}' | sed 's|^/||')"
-  GW="$(detect_gateway "$CNAME")"
+  CNAME="$(docker inspect "$CONTAINER" --format '{{.Name}}' 2>/dev/null | sed 's|^/||' || true)"
+  GW="$(detect_gateway "$CNAME" || true)"
   [ -n "$GW" ] || die "探测不到网桥网关"
   ok "容器: $CNAME   网桥网关: $GW"
 

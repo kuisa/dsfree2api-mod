@@ -53,6 +53,13 @@ SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "5"))
 # 搜索/上游超时
 SEARCH_TIMEOUT = int(os.getenv("SEARCH_TIMEOUT", "20"))
 UPSTREAM_TIMEOUT = int(os.getenv("UPSTREAM_TIMEOUT", "300"))
+
+# 上游免费站点对单条消息有约 10000 字符硬上限（无余额时）。超限会被 413 拒绝，
+# 容器随即跨站重试（de→es→fr），单次请求从 2 秒拖到几十秒甚至 502。
+# 这里在转发前把消息裁剪到上限以内；0 = 关闭裁剪（保持纯透传）。
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "9000"))
+# 消息至少要留这么多字符（工具定义再多也不能把对话挤没）
+MIN_MSG_CHARS = int(os.getenv("MIN_MSG_CHARS", "3000"))
 # ===========================================
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,6 +68,148 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] [PROXY] {msg}", flush=True)
+
+
+# ── 消息裁剪：把请求压到上游字符上限以内 ──────────────────────
+def _msg_chars(messages):
+    """统计消息文本的字符数（上游按字符数判定超限）。"""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    t = part.get("text")
+                    if isinstance(t, str):
+                        total += len(t)
+    return total
+
+
+def _json_chars(obj):
+    """对象序列化后的字符数（工具定义等非 content 字段用它计预算）。"""
+    if not obj:
+        return 0
+    try:
+        return len(json.dumps(obj, ensure_ascii=False))
+    except Exception:
+        return 0
+
+
+def fit_tools(tools, budget):
+    """工具定义超预算时逐级瘦身：折半描述 → 清空描述 → 丢弃尾部工具。
+    清空描述后 name / 参数名 / 类型都还在，工具调用依然可用。
+    返回 (tools, 是否裁剪过)。"""
+    if not tools or _json_chars(tools) <= budget:
+        return tools, False
+    try:
+        import copy
+        out = copy.deepcopy(tools)
+    except Exception:
+        return tools, False
+
+    def shrink(objs, min_len):
+        for t in objs:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get("function") or {}
+            d = fn.get("description")
+            if isinstance(d, str) and len(d) > min_len:
+                fn["description"] = d[: max(min_len, len(d) // 2)]
+            props = ((fn.get("parameters") or {}).get("properties")) or {}
+            if isinstance(props, dict):
+                for pv in props.values():
+                    if isinstance(pv, dict):
+                        pd = pv.get("description")
+                        if isinstance(pd, str) and len(pd) > min_len:
+                            pv["description"] = pd[: max(min_len, len(pd) // 2)]
+
+    # 1) 逐轮折半描述
+    for _ in range(4):
+        if _json_chars(out) <= budget:
+            return out, True
+        shrink(out, 40)
+
+    # 2) 清空所有描述（保留结构，工具调用仍可用）
+    for t in out:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or {}
+        if isinstance(fn.get("description"), str):
+            fn["description"] = ""
+        props = ((fn.get("parameters") or {}).get("properties")) or {}
+        if isinstance(props, dict):
+            for pv in props.values():
+                if isinstance(pv, dict) and isinstance(pv.get("description"), str):
+                    pv["description"] = ""
+    if _json_chars(out) <= budget:
+        return out, True
+
+    # 2.5) 只留必填参数，去掉可选参数的 schema
+    for t in out:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") or {}
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        props = params.get("properties")
+        req = params.get("required") or []
+        if isinstance(props, dict) and req:
+            params["properties"] = {k: v for k, v in props.items() if k in req}
+    if _json_chars(out) <= budget:
+        return out, True
+
+    # 3) 仍超 → 从尾部丢弃，但 TOOL_NAME（web_search）永远优先保留
+    keep, rest = [], []
+    for t in out:
+        name = ((t or {}).get("function") or {}).get("name") if isinstance(t, dict) else None
+        (keep if name == TOOL_NAME else rest).append(t)
+    for t in rest:
+        if _json_chars(keep + [t]) > budget:
+            continue          # 塞不下的跳过，但不影响已保留的
+        keep.append(t)
+    if not keep:
+        keep = out[:1]        # 极端情况至少留一个
+    return keep, True
+
+
+def fit_messages(messages, limit=None):
+    """把消息裁到 limit 字符以内：保留 system + 最新消息，从最旧的开始丢，
+    仍超则从最长的一条开始截断。返回 (新消息列表, 是否裁剪过)。"""
+    limit = MAX_INPUT_CHARS if limit is None else limit
+    if limit <= 0 or not messages:
+        return messages, False
+    if _msg_chars(messages) <= limit:
+        return messages, False
+
+    msgs = list(messages)
+    sys_msgs = [m for m in msgs if m.get("role") == "system"]
+    rest = [m for m in msgs if m.get("role") != "system"]
+
+    # 1) 丢最旧的非 system 消息（始终保留最后一条 = 当前提问）
+    while len(rest) > 1 and _msg_chars(sys_msgs + rest) > limit:
+        rest.pop(0)
+
+    out = sys_msgs + rest
+
+    # 2) 仍超 → 从最长的一条开始截断
+    guard = 0
+    while _msg_chars(out) > limit and guard < 50:
+        guard += 1
+        idx, best = -1, -1
+        for i, m in enumerate(out):
+            c = m.get("content")
+            if isinstance(c, str) and len(c) > best:
+                best, idx = len(c), i
+        if idx < 0 or best <= 0:
+            break
+        excess = _msg_chars(out) - limit
+        keep = max(200, best - excess - 60)
+        out[idx]["content"] = out[idx]["content"][:keep] + "\n…（内容过长已截断）"
+
+    return out, True
 
 
 # ── HTTP 小工具 ───────────────────────────────────────────────
@@ -596,6 +745,23 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(body.get("stream"))
         messages = list(body.get("messages") or [])
         tools = list(body.get("tools") or [])
+
+        # 上游按「整个 prompt」计字符：messages + 工具定义都要算进预算。
+        # 只裁消息、不管工具，总量仍会顶过 10000 → 413。
+        _tools_in = len(tools)
+        _tools_before = _json_chars(tools)
+        tools, _t_trimmed = fit_tools(tools, max(0, MAX_INPUT_CHARS - MIN_MSG_CHARS))
+        _tools_chars = _json_chars(tools)
+        _msg_budget = max(800, MAX_INPUT_CHARS - _tools_chars)
+        _before = _msg_chars(messages)
+        messages, _m_trimmed = fit_messages(messages, limit=_msg_budget)
+        if _m_trimmed or _t_trimmed:
+            log(f"载荷裁剪：消息 {_before}→{_msg_chars(messages)}"
+                f"，工具 {_tools_in}→{len(tools)} 个 / {_tools_before}→{_tools_chars} 字符"
+                f"（上限 {MAX_INPUT_CHARS}，消息预算 {_msg_budget}）")
+        body["messages"] = messages
+        if "tools" in body:
+            body["tools"] = tools
 
         if AUTO_INJECT_TOOL and TOOL_NAME not in _tool_names(tools):
             tools = tools + [SEARCH_TOOL]

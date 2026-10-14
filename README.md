@@ -5,6 +5,15 @@
 
 不需要买第三方打码服务 —— 用真浏览器过验证，本地跑，100% 可控。
 
+> **架构**：本仓库同时支持 **x86_64** 和 **aarch64/ARM64**，`deploy.sh` 会自动
+> 用 `uname -m` 判断：x86 装 Google Chrome，ARM 装 Chromium 并软链到
+> `/usr/bin/google-chrome`（SeleniumBase 只探测该路径）。
+>
+> 当前基线：**dsfree2api v0.6.6**（`DSFREE_COMMIT=0e97f30`）
+>
+> **两个平台用完全相同的脚本和严格模式**（`set -euo pipefail`），没有任何
+> 架构相关的分支差异 —— 唯一的架构判断只影响装 Chrome 还是 Chromium。
+
 ## 一键部署
 
 在干净的 Debian 12/13 或 Ubuntu 22.04+ VPS 上：

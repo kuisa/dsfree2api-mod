@@ -78,7 +78,7 @@ index 4ff37c2..6f717cb 100644
  // passed the Turnstile check, so chat works while [turnstile] is off or the
  // solver service is down. Cookies are bound to the IP/UA that obtained them,
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
-index c10861b..756f2c6 100644
+index b45bc12..03348c2 100644
 --- a/internal/upstream/client.go
 +++ b/internal/upstream/client.go
 @@ -17,6 +17,7 @@ import (
@@ -89,10 +89,10 @@ index c10861b..756f2c6 100644
  	"time"
  	"unicode/utf8"
  
-@@ -72,6 +73,26 @@ type Client struct {
- 	// quotaCool marks sites that recently answered with quota errors; they
- 	// are tried after the healthy mirrors until the cooldown expires.
- 	quotaCool map[string]time.Time
+@@ -69,6 +70,26 @@ type Client struct {
+ 	cfgLocks map[string]*sync.Mutex
+ 	gates    map[string]*siteGate
+ 
 +	// quotaRemaining caches the last observed free-tier remaining per site.
 +	// Request-time routing reads it to skip a site that is about to run dry
 +	// without paying a balance round-trip on the hot path.
@@ -116,7 +116,7 @@ index c10861b..756f2c6 100644
  	// lastWarn* dedupes repeated identical upstream errors so a quota
  	// storm cannot drown the log.
  	lastWarnMsg string
-@@ -81,6 +102,9 @@ type Client struct {
+@@ -78,6 +99,9 @@ type Client struct {
  	// exhaustion of each request — including ones hidden by cross-site
  	// failover.
  	quotaObserver func(site, model, route string, err error)
@@ -126,20 +126,24 @@ index c10861b..756f2c6 100644
  
  	// chatOnceOverride is a test seam; nil in production.
  	chatOnceOverride func(ctx context.Context, site config.Site, modelID string, model config.Model,
-@@ -95,11 +119,16 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
- 		cfg:       cfg,
- 		ts:        ts,
- 		log:       log,
--		pool:      pool,
--		chatCfg:   map[string]chatConfig{},
--		cfgLocks:  map[string]*sync.Mutex{},
--		gates:     map[string]*siteGate{},
--		quotaCool: map[string]time.Time{},
+@@ -89,13 +113,18 @@ func New(cfg *config.Config, ts *turnstile.Solver, log *slog.Logger, pool RouteS
+ 		log = slog.Default()
+ 	}
+ 	return &Client{
+-		cfg:      cfg,
+-		ts:       ts,
+-		log:      log,
+-		pool:     pool,
+-		chatCfg:  map[string]chatConfig{},
+-		cfgLocks: map[string]*sync.Mutex{},
+-		gates:    map[string]*siteGate{},
++		cfg:       cfg,
++		ts:        ts,
++		log:       log,
 +		pool:           pool,
 +		chatCfg:        map[string]chatConfig{},
 +		cfgLocks:       map[string]*sync.Mutex{},
 +		gates:          map[string]*siteGate{},
-+		quotaCool:      map[string]time.Time{},
 +		quotaRemaining: map[string]int{},
 +		quotaLimit:     map[string]int{},
 +		minRemaining:   envInt(envPrewarmMinRemaining, 10000),
@@ -148,8 +152,8 @@ index c10861b..756f2c6 100644
  	}
  }
  
-@@ -186,6 +215,21 @@ func (c *Client) sortQuotaCoolLast(ids []string) []string {
- 	return append(rest, cooled...)
+@@ -137,6 +166,111 @@ func (c *Client) Routes() []Route {
+ 	return out
  }
  
 +// rotateCandidates round-robins the candidate order. Each call advances a
@@ -167,13 +171,6 @@ index c10861b..756f2c6 100644
 +	return out
 +}
 +
- // clearQuotaCool lifts a site's cooldown once it serves again after a quota
- // error — the fresh visitor identity restored its daily tier.
- func (c *Client) clearQuotaCool(code string) {
-@@ -200,6 +244,96 @@ func (c *Client) clearQuotaCool(code string) {
- 	}
- }
- 
 +// setQuotaRemaining records the last observed free-tier remaining for a site.
 +// Called by the balance probe and by the background refresher.
 +func (c *Client) setQuotaBalance(code string, remaining, limit int) {
@@ -267,7 +264,7 @@ index c10861b..756f2c6 100644
  // probeBalanceAsync logs the site's current free tier after a quota
  // recovery. Best effort — failures only show up at DEBUG.
  func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route Route) {
-@@ -220,6 +354,8 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
+@@ -157,6 +291,8 @@ func (c *Client) probeBalanceAsync(site config.Site, model config.Model, route R
  		}
  		c.log.Info("site balance", "site", site.Code,
  			"remaining", bal.Free.Remaining, "limit", bal.Free.Limit)
@@ -276,7 +273,7 @@ index c10861b..756f2c6 100644
  	}()
  }
  
-@@ -320,10 +456,18 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
+@@ -253,6 +389,14 @@ func (c *Client) Chat(ctx context.Context, modelID string, prompt string, info *
  			candidates = append(candidates, alt)
  		}
  	}
@@ -284,10 +281,6 @@ index c10861b..756f2c6 100644
 +	// the same endpoint. Without this the requested model always won and a
 +	// single site absorbed every call until its daily tier ran dry.
 +	candidates = c.rotateCandidates(candidates)
- 	// A site that recently reported quota errors keeps being tried, but
- 	// behind the healthy mirrors — continuation rounds stop paying its
- 	// refresh tax while its balance is empty.
- 	candidates = c.sortQuotaCoolLast(candidates)
 +	// Working baseline: a site whose cached free tier has dropped to
 +	// PREWARM_MIN_REMAINING is routed around at request time, so the switch
 +	// happens before the request instead of after a quota failure.
@@ -297,10 +290,10 @@ index c10861b..756f2c6 100644
  	triedPrimary := false
 diff --git a/internal/upstream/prewarm.go b/internal/upstream/prewarm.go
 new file mode 100644
-index 0000000..9c96079
+index 0000000..4633bd5
 --- /dev/null
 +++ b/internal/upstream/prewarm.go
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,369 @@
 +package upstream
 +
 +import (
@@ -599,7 +592,6 @@ index 0000000..9c96079
 +	p.log.Info("prewarm: quota at baseline, rotating visitor identity",
 +		"site", site.Code, "remaining", remaining, "baseline", p.minRemaining)
 +	if newGID := p.c.ts.RotateGuest(site.Code); newGID != "" {
-+		p.c.clearQuotaCool(site.Code)
 +		p.log.Info("prewarm: rotated visitor identity", "site", site.Code)
 +	} else {
 +		// 没有缓存会话可换 → 走完整刷新（会重新过 Turnstile）
